@@ -1,6 +1,7 @@
 #include <forge/logger.h>
 #include <forge/err.h>
 #include <forge/io.h>
+#include <forge/utils.h>
 
 #include <ncurses.h>
 
@@ -17,19 +18,17 @@
 #define SPACE 32
 
 typedef struct line {
-        char *data;
+        char *chars;
         size_t len;
         size_t cap;
 } line;
 
 typedef struct {
-        line **lines;
-        size_t len;
-        size_t cap;
-} text;
-
-typedef struct {
-        text text;
+        struct {
+                line **data;
+                size_t len;
+                size_t cap;
+        } lines;
         struct {
                 size_t r;
                 size_t c;
@@ -62,94 +61,118 @@ init_ncurses(void)
 line *
 line_alloc(void)
 {
-        line *l = (line *)malloc(sizeof(line));
-        l->data = NULL;
-        l->len = 0;
-        l->cap = 0;
-        return l;
-}
-
-text
-text_init(void)
-{
-        line **lines = (line **)malloc(sizeof(line *) * g_scrn_height);
-        for (size_t i = 0; i < g_scrn_height; ++i) {
-                lines[i] = line_alloc();
-        }
-
-        return (text) {
-                .lines = lines,
-                .len = g_scrn_height,
-                .cap = g_scrn_height,
-        };
+        line *ln = (line *)malloc(sizeof(line));
+        ln->chars = NULL;
+        ln->len = 0;
+        ln->cap = 0;
+        return ln;
 }
 
 sten_context
 init_context(void)
 {
-        sten_context ctx = {0};
+        return (sten_context) {
+                .lines = {
+                        .data = NULL,
+                        .len = 0,
+                        .cap = 0,
+                },
+                .cursor = {
+                        .r = 0,
+                        .c = 0,
+                },
+                .win = {
+                        .cur = stdscr,
+                        .w = g_scrn_width,
+                        .h = g_scrn_height,
+                        .x_offset = 0,
+                        .y_offset = 0,
+                },
+        };
+}
 
-        ctx.text = text_init();
+static void
+adjust_view(sten_context *ctx)
+{
+        /* Vertical scrolling */
+        if (ctx->cursor.r < ctx->win.y_offset) {
+                ctx->win.y_offset = ctx->cursor.r;
+        }
+        if (ctx->cursor.r >= ctx->win.y_offset + ctx->win.h) {
+                ctx->win.y_offset = ctx->cursor.r - ctx->win.h + 1;
+        }
 
-        ctx.win.cur = newwin(g_scrn_height - 1, g_scrn_width, 0, 0);
-        ctx.win.w = g_scrn_width;
-        ctx.win.h = g_scrn_height;
-        ctx.win.x_offset = 0;
-        ctx.win.y_offset = 0;
-
-        ctx.cursor.r = 0;
-        ctx.cursor.c = 0;
-
-        return ctx;
+        /* Horizontal scrolling */
+        size_t line_len = 0;
+        if (ctx->cursor.r < ctx->lines.len) {
+                line_len = ctx->lines.data[ctx->cursor.r]->len;
+        }
+        if (ctx->cursor.c > line_len) {
+                ctx->cursor.c = line_len; /* Clamp (should not be needed) */
+        }
+        if (ctx->cursor.c < ctx->win.x_offset) {
+                ctx->win.x_offset = ctx->cursor.c;
+        }
+        if (ctx->cursor.c >= ctx->win.x_offset + ctx->win.w) {
+                ctx->win.x_offset = ctx->cursor.c - ctx->win.w + 1;
+        }
 }
 
 void
 insert_at_cursor(sten_context *ctx, char ch)
 {
-        line *line = ctx->text.lines[ctx->cursor.r];
-        assert(line != NULL);
-
-        if (line->len >= line->cap) {
-                line->cap = !line->cap ? 256 : line->cap * 2;
-                line->data = (char *)realloc(line->data, line->cap);
-                assert(line->data != NULL);
+        /* Ensure there are enough lines up to the cursor row */
+        while (ctx->cursor.r >= ctx->lines.len) {
+                if (ctx->lines.len == ctx->lines.cap) {
+                        ctx->lines.cap = ctx->lines.cap ? ctx->lines.cap * 2 : 8;
+                        ctx->lines.data = realloc(ctx->lines.data, sizeof(line *) * ctx->lines.cap);
+                }
+                line *ln = line_alloc();
+                ctx->lines.data[ctx->lines.len++] = ln;
         }
 
-        // Shift existing characters to the right
-        if (line->len > ctx->cursor.c) {
-                memmove(line->data + ctx->cursor.c + 1,
-                        line->data + ctx->cursor.c,
-                        line->len - ctx->cursor.c);
+        line *ln = ctx->lines.data[ctx->cursor.r];
+
+        /* Ensure capacity in the line */
+        if (ln->len == ln->cap) {
+                ln->cap = ln->cap ? ln->cap * 2 : 8;
+                ln->chars = realloc(ln->chars, ln->cap);
         }
 
-        // Insert the new character
-        line->data[ctx->cursor.c] = ch;
-        line->len++;
-
-        // Null-terminate the string
-        if (line->len < line->cap) {
-                line->data[line->len] = '\0';
-        }
-
-        // Update cursor position
+        /* Shift characters right and insert */
+        memmove(ln->chars + ctx->cursor.c + 1, ln->chars + ctx->cursor.c, ln->len - ctx->cursor.c);
+        ln->chars[ctx->cursor.c] = ch;
+        ln->len++;
         ctx->cursor.c++;
+
+        adjust_view(ctx);
 }
 
 void
 render(const sten_context *ctx)
 {
-        werase(ctx->win.cur);
+        erase(); /* Clear the screen */
 
-        for (size_t i = 0; i < ctx->text.len; ++i) {
-                if (i >= ctx->win.h) break; // Don't render beyond window height
-                if (ctx->text.lines[i]->data != NULL) {
-                        mvwprintw(ctx->win.cur, i, 0, "%s", ctx->text.lines[i]->data);
+        /* Render visible lines */
+        for (size_t sy = 0; sy < ctx->win.h; sy++) {
+                size_t buf_r = ctx->win.y_offset + sy;
+                if (buf_r >= ctx->lines.len) {
+                        /* Non-existent lines */
+                        //mvaddch(sy, 0, '~');
+                        continue;
+                }
+                line *ln = ctx->lines.data[buf_r];
+                size_t sx = 0;
+                for (size_t bx = ctx->win.x_offset; bx < ln->len && sx < ctx->win.w; bx++, sx++) {
+                        mvaddch(sy, sx, ln->chars[bx]);
                 }
         }
 
-        // Move cursor to its position
-        wmove(ctx->win.cur, ctx->cursor.r - ctx->win.y_offset, ctx->cursor.c - ctx->win.x_offset);
-        wrefresh(ctx->win.cur);
+        /* Set cursor position on screen */
+        size_t screen_y = ctx->cursor.r - ctx->win.y_offset;
+        size_t screen_x = ctx->cursor.c - ctx->win.x_offset;
+        move(screen_y, screen_x);
+        refresh();
 }
 
 void
@@ -158,199 +181,138 @@ left(sten_context *ctx)
         if (ctx->cursor.c > 0) {
                 ctx->cursor.c--;
         }
+        adjust_view(ctx); /* Added for consistency with other movements */
 }
 
 void
 right(sten_context *ctx)
 {
-        line *current_line = ctx->text.lines[ctx->cursor.r];
-        if (ctx->cursor.c < current_line->len) {
+        if (ctx->cursor.r >= ctx->lines.len) return;
+        line *ln = ctx->lines.data[ctx->cursor.r];
+        if (ctx->cursor.c < ln->len) {
                 ctx->cursor.c++;
         }
+        adjust_view(ctx);
 }
 
 void
 up(sten_context *ctx)
 {
-        forge_logger_log(&logger, FORGE_LOG_LEVEL_DEBUG, "down(): ctx->cursor.r = %zu", ctx->cursor.r);
         if (ctx->cursor.r > 0) {
-                ctx->cursor.r--; // Move to previous line
-                line *target_line = ctx->text.lines[ctx->cursor.r];
-                // Adjust column to not exceed target line's length
-                if (ctx->cursor.c > target_line->len) {
-                        ctx->cursor.c = target_line->len;
+                ctx->cursor.r--;
+                line *ln = ctx->lines.data[ctx->cursor.r];
+                if (ctx->cursor.c > ln->len) {
+                        ctx->cursor.c = ln->len;
                 }
         }
+        adjust_view(ctx);
 }
 
 void
 down(sten_context *ctx)
 {
-        forge_logger_log(&logger, FORGE_LOG_LEVEL_DEBUG, "down(): len = %zu", ctx->text.len);
-        if (ctx->cursor.r < ctx->text.len - 1) {
-                ctx->cursor.r++; // Move to next line
-                line *target_line = ctx->text.lines[ctx->cursor.r];
-                // Adjust column to not exceed target line's length
-                if (ctx->cursor.c > target_line->len) {
-                        ctx->cursor.c = target_line->len;
+        if (ctx->cursor.r + 1 < ctx->lines.len) {
+                ctx->cursor.r++;
+                line *ln = ctx->lines.data[ctx->cursor.r];
+                if (ctx->cursor.c > ln->len) {
+                        ctx->cursor.c = ln->len;
                 }
         }
+        adjust_view(ctx);
 }
 
 void
 enter(sten_context *ctx)
 {
-        line *current_line = ctx->text.lines[ctx->cursor.r];
-        assert(current_line != NULL);
-
-        // If text buffer is full, reallocate
-        if (ctx->text.len >= ctx->text.cap) {
-                ctx->text.cap *= 2;
-                ctx->text.lines = (line **)realloc(ctx->text.lines, ctx->text.cap * sizeof(line *));
-                assert(ctx->text.lines != NULL);
-                // Initialize new lines
-                for (size_t i = ctx->text.len; i < ctx->text.cap; ++i) {
-                        ctx->text.lines[i] = line_alloc();
+        line *cur = NULL;
+        if (ctx->cursor.r < ctx->lines.len) {
+                cur = ctx->lines.data[ctx->cursor.r];
+        } else {
+                /* Add new line at end if cursor is beyond */
+                if (ctx->lines.len == ctx->lines.cap) {
+                        ctx->lines.cap = ctx->lines.cap ? ctx->lines.cap * 2 : 8;
+                        ctx->lines.data = realloc(ctx->lines.data, sizeof(line *) * ctx->lines.cap);
                 }
-        }
-
-        // Create a new line
-        line *new_line = line_alloc();
-
-        // Case 1: Cursor at the beginning
-        if (ctx->cursor.c == 0) {
-                // Shift all lines down from cursor.r
-                memmove(&ctx->text.lines[ctx->cursor.r + 1],
-                        &ctx->text.lines[ctx->cursor.r],
-                        (ctx->text.len - ctx->cursor.r) * sizeof(line *));
-                ctx->text.lines[ctx->cursor.r] = new_line;
-                ctx->text.len++;
-                ctx->cursor.r++;
+                line *ln = line_alloc();
+                ctx->lines.data[ctx->lines.len++] = ln;
                 ctx->cursor.c = 0;
+                adjust_view(ctx);
+                return;
         }
-        // Case 2: Cursor at the end
-        else if (ctx->cursor.c == current_line->len) {
-                // Insert new line after current line
-                memmove(&ctx->text.lines[ctx->cursor.r + 2],
-                        &ctx->text.lines[ctx->cursor.r + 1],
-                        (ctx->text.len - ctx->cursor.r - 1) * sizeof(line *));
-                ctx->text.lines[ctx->cursor.r + 1] = new_line;
-                ctx->text.len++;
-                ctx->cursor.r++;
-                ctx->cursor.c = 0;
+
+        /* Create new line for split */
+        line *newln = line_alloc();
+        size_t split_len = cur->len - ctx->cursor.c;
+        if (split_len > 0) {
+                newln->cap = split_len;
+                newln->chars = malloc(newln->cap);
+                memcpy(newln->chars, cur->chars + ctx->cursor.c, split_len);
+                newln->len = split_len;
+                cur->len = ctx->cursor.c;
         }
-        // Case 3: Cursor in the middle
-        else {
-                // Split current line at cursor
-                size_t split_pos = ctx->cursor.c;
-                size_t remaining_len = current_line->len - split_pos;
 
-                // New line's data
-                new_line->data = (char *)malloc(current_line->cap);
-                assert(new_line->data != NULL);
-                new_line->cap = current_line->cap;
-                new_line->len = remaining_len;
-
-                // Copy the second part of the current line to the new line
-                memcpy(new_line->data, current_line->data + split_pos, remaining_len);
-                new_line->data[remaining_len] = '\0';
-
-                // Truncate current line at cursor
-                current_line->len = split_pos;
-                current_line->data[split_pos] = '\0';
-
-                // Insert new line after current line
-                memmove(&ctx->text.lines[ctx->cursor.r + 2],
-                        &ctx->text.lines[ctx->cursor.r + 1],
-                        (ctx->text.len - ctx->cursor.r - 1) * sizeof(line *));
-                ctx->text.lines[ctx->cursor.r + 1] = new_line;
-                ctx->text.len++;
-                ctx->cursor.r++;
-                ctx->cursor.c = 0;
+        /* Insert new line after current */
+        if (ctx->lines.len == ctx->lines.cap) {
+                ctx->lines.cap = ctx->lines.cap ? ctx->lines.cap * 2 : 8;
+                ctx->lines.data = realloc(ctx->lines.data, sizeof(line *) * ctx->lines.cap);
         }
+        memmove(ctx->lines.data + ctx->cursor.r + 2, ctx->lines.data + ctx->cursor.r + 1, (ctx->lines.len - ctx->cursor.r - 1) * sizeof(line *));
+        ctx->lines.data[ctx->cursor.r + 1] = newln;
+        ctx->lines.len++;
+
+        /* Move cursor to new line */
+        ctx->cursor.r++;
+        ctx->cursor.c = 0;
+
+        adjust_view(ctx);
 }
 
 void
 backspace(sten_context *ctx)
 {
-        line *current_line = ctx->text.lines[ctx->cursor.r];
-        assert(current_line != NULL);
+        if (ctx->lines.len == 0 || ctx->cursor.r >= ctx->lines.len) return;
 
-        // Case 1: Cursor is not at the start of the line
+        line *ln = ctx->lines.data[ctx->cursor.r];
         if (ctx->cursor.c > 0) {
-                // Shift characters left to overwrite the character before the cursor
-                memmove(current_line->data + ctx->cursor.c - 1,
-                        current_line->data + ctx->cursor.c,
-                        current_line->len - ctx->cursor.c + 1); // +1 to include null terminator
-                current_line->len--;
+                /* Delete previous char in line */
+                memmove(ln->chars + ctx->cursor.c - 1, ln->chars + ctx->cursor.c, ln->len - ctx->cursor.c);
+                ln->len--;
                 ctx->cursor.c--;
+        } else if (ctx->cursor.r > 0) {
+                /* Merge with previous line */
+                line *prev = ctx->lines.data[ctx->cursor.r - 1];
+                size_t old_prev_len = prev->len;
 
-                // Shrink allocation if necessary
-                if (current_line->len < current_line->cap / 2 && current_line->cap > 256) {
-                        current_line->cap /= 2;
-                        current_line->data = (char *)realloc(current_line->data, current_line->cap);
-                        assert(current_line->data != NULL);
+                /* Ensure capacity in prev */
+                size_t new_cap = prev->cap;
+                while (prev->len + ln->len > new_cap) {
+                        new_cap = new_cap ? new_cap * 2 : 8;
                 }
-        }
-        // Case 2: Cursor is at the start of the line, and it's not the first line
-        else if (ctx->cursor.r > 0) {
-                line *prev_line = ctx->text.lines[ctx->cursor.r - 1];
-                assert(prev_line != NULL);
+                if (new_cap != prev->cap) {
+                        prev->cap = new_cap;
+                        prev->chars = realloc(prev->chars, prev->cap);
+                }
 
-                // Move cursor to the end of the previous line
-                ctx->cursor.c = prev_line->len;
+                /* Append current line to prev */
+                if (ln->len > 0) {
+                        memcpy(prev->chars + prev->len, ln->chars, ln->len);
+                        prev->len += ln->len;
+                }
+
+                /* Free current line */
+                free(ln->chars);
+                free(ln);
+
+                /* Shift lines up */
+                memmove(ctx->lines.data + ctx->cursor.r, ctx->lines.data + ctx->cursor.r + 1, (ctx->lines.len - ctx->cursor.r - 1) * sizeof(line *));
+                ctx->lines.len--;
+
+                /* Move cursor to end of prev line */
                 ctx->cursor.r--;
-
-                // If current line is not empty, append its contents to the previous line
-                if (current_line->len > 0) {
-                        // Ensure previous line has enough capacity
-                        if (prev_line->len + current_line->len >= prev_line->cap) {
-                                prev_line->cap = (prev_line->len + current_line->len + 256) & ~255; // Round up to next 256
-                                prev_line->data = (char *)realloc(prev_line->data, prev_line->cap);
-                                assert(prev_line->data != NULL);
-                        }
-
-                        // Append current line's data to previous line
-                        memcpy(prev_line->data + prev_line->len, current_line->data, current_line->len);
-                        prev_line->len += current_line->len;
-                        prev_line->data[prev_line->len] = '\0';
-                }
-
-                // Free the current line
-                free(current_line->data);
-                free(current_line);
-
-                // Shift remaining lines up
-                memmove(&ctx->text.lines[ctx->cursor.r + 1],
-                        &ctx->text.lines[ctx->cursor.r + 2],
-                        (ctx->text.len - ctx->cursor.r - 2) * sizeof(line *));
-                ctx->text.len--;
-
-                // Shrink text buffer if necessary
-                if (ctx->text.len < ctx->text.cap / 2 && ctx->text.cap > g_scrn_height) {
-                        ctx->text.cap /= 2;
-                        ctx->text.lines = (line **)realloc(ctx->text.lines, ctx->text.cap * sizeof(line *));
-                        assert(ctx->text.lines != NULL);
-                }
-        }
-        // Case 3: Cursor is at the start of the first line, do nothing
-}
-
-void
-save_file(const sten_context *ctx)
-{
-        const char *fp = "1.txt";
-        char **lines = (char **)malloc(sizeof(char *) * ctx->text.len);
-
-        for (size_t i = 0; i < ctx->text.len; ++i) {
-                lines[i] = ctx->text.lines[i]->data;
+                ctx->cursor.c = old_prev_len;
         }
 
-        if (!forge_io_write_lines(fp, (const char **)lines, ctx->text.len)) {
-                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "could not save file");
-        }
-
-        free(lines);
+        adjust_view(ctx);
 }
 
 void
@@ -385,9 +347,6 @@ input_loop(void)
                 case CTRL('h'):
                 case BACKSPACE: {
                         backspace(&ctx);
-                } break;
-                case CTRL('s'): {
-                        save_file(&ctx);
                 } break;
                 default: {
                         if (isprint(ch)) {
