@@ -610,6 +610,10 @@ input_loop(int argc, char **argv)
                         backspace(&ctx);
                 } break;
                 default: {
+                        if (ch == '\t') {
+                                for (size_t i = 0; i < 4; ++i)
+                                        insert_at_cursor(&ctx, ' ');
+                        }
                         if (isprint(ch)) {
                                 insert_at_cursor(&ctx, ch);
                         }
