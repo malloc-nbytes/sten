@@ -2,14 +2,17 @@
 #include <forge/err.h>
 #include <forge/io.h>
 #include <forge/utils.h>
+#include <forge/arg.h>
 
 #include <ncurses.h>
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #define CTRL(x) ((x) & 0x1F)
 #define BACKSPACE 263
@@ -40,12 +43,125 @@ typedef struct {
                 size_t x_offset;
                 size_t y_offset;
         } win;
+        FILE *fp;
 } sten_context;
 
 static size_t g_scrn_width = 0;
 static size_t g_scrn_height = 0;
 
 static forge_logger logger;
+
+char **
+read_file_to_lines(FILE *f)
+{
+        char *line = NULL;
+        size_t len = 0;
+        ssize_t read;
+
+        struct {
+                char **data;
+                size_t len;
+                size_t cap;
+        } buf = {
+                .data = NULL,
+                .cap = 0,
+                .len = 0,
+        };
+
+        while ((read = getline(&line, &len, f)) != -1) {
+                if (line[read - 1] == '\n') {
+                        line[read - 1] = '\0';
+                }
+                if (buf.len >= buf.cap) {
+                        buf.cap = buf.cap == 0 ? 2 : buf.cap*2;
+                        buf.data = realloc(buf.data, buf.cap * sizeof(char *));
+                }
+                buf.data[buf.len++] = strdup(line);
+        }
+
+        if (buf.len >= buf.cap) {
+                buf.cap = buf.cap == 0 ? 2 : buf.cap*2;
+                buf.data = realloc(buf.data, buf.cap * sizeof(char *));
+        }
+        buf.data[buf.len++] = NULL;
+
+        free(line);
+
+        return buf.data;
+}
+
+int
+write_lines(FILE *f, const line **lines, size_t lines_n)
+{
+        if (fseek(f, 0, SEEK_SET) != 0) {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to seek to start of file: %s", strerror(errno));
+                return 0;
+        }
+
+        if (ftruncate(fileno(f), 0) != 0) {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to truncate file: %s", strerror(errno));
+                return 0;
+        }
+
+        for (size_t i = 0; i < lines_n; ++i) {
+                if (lines[i] && lines[i]->chars && lines[i]->len > 0) {
+                        if (fwrite(lines[i]->chars, 1, lines[i]->len, f) != lines[i]->len) {
+                                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to write line %zu: %s", i, strerror(errno));
+                                return 0;
+                        }
+                        if (fputc('\n', f) == EOF) {
+                                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to write newline for line %zu: %s", i, strerror(errno));
+                                return 0;
+                        }
+                } else {
+                        // Write a newline for empty lines
+                        if (fputc('\n', f) == EOF) {
+                                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to write newline for empty line %zu: %s", i, strerror(errno));
+                                return 0;
+                        }
+                }
+        }
+
+        if (fflush(f) != 0) {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to flush file: %s", strerror(errno));
+                return 0;
+        }
+
+        return 1;
+}
+
+/* int */
+/* write_lines(FILE *f, const line **lines, size_t lines_n) */
+/* { */
+/*         if (fseek(f, 0, SEEK_SET) != 0) { */
+/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to seek to start of file: %s", strerror(errno)); */
+/*                 return 0; */
+/*         } */
+
+/*         // Truncate the file to zero length */
+/*         if (ftruncate(fileno(f), 0) != 0) { */
+/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to truncate file: %s", strerror(errno)); */
+/*                 return 0; */
+/*         } */
+
+/*         // Write lines */
+/*         for (size_t i = 0; i < lines_n; ++i) { */
+/*                 if (lines[i] && lines[i]->chars) { */
+/*                         if (fprintf(f, "%s\n", lines[i]->chars) < 0) { */
+/*                                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to write line %zu: %s", i, strerror(errno)); */
+/*                                 return 0; */
+/*                         } */
+/*                 } */
+/*         } */
+
+/*         // Flush the file to ensure data is written */
+/*         if (fflush(f) != 0) { */
+/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to flush file: %s", strerror(errno)); */
+/*                 return 0; */
+/*         } */
+
+/*         return 1; */
+/* } */
 
 void
 init_ncurses(void)
@@ -88,6 +204,7 @@ init_context(void)
                         .x_offset = 0,
                         .y_offset = 0,
                 },
+                .fp = NULL,
         };
 }
 
@@ -123,6 +240,7 @@ insert_at_cursor(sten_context *ctx, char ch)
 {
         /* Ensure there are enough lines up to the cursor row */
         while (ctx->cursor.r >= ctx->lines.len) {
+                // TODO: refactor this code out
                 if (ctx->lines.len == ctx->lines.cap) {
                         ctx->lines.cap = ctx->lines.cap ? ctx->lines.cap * 2 : 8;
                         ctx->lines.data = realloc(ctx->lines.data, sizeof(line *) * ctx->lines.cap);
@@ -347,7 +465,7 @@ del_char_under_cursor(sten_context *ctx)
         } else if (ctx->cursor.r + 1 < ctx->lines.len) {
                 /* Merge with next line if at end of current line */
                 line *next = ctx->lines.data[ctx->cursor.r + 1];
-                size_t old_len = ln->len;
+                //size_t old_len = ln->len;
 
                 /* Ensure capacity in current line */
                 size_t new_cap = ln->cap;
@@ -378,15 +496,87 @@ del_char_under_cursor(sten_context *ctx)
 }
 
 void
-input_loop(void)
+save(const sten_context *ctx)
+{
+        if (!ctx->fp) {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "No file opened for saving");
+                return;
+        }
+
+        if (!write_lines(ctx->fp, (const line **)ctx->lines.data, ctx->lines.len)) {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to save file");
+        } else {
+                forge_logger_log(&logger, FORGE_LOG_LEVEL_INFO, "File saved successfully");
+        }
+}
+
+void
+load_txt_from_file(sten_context *ctx,
+                   FILE         *fp)
+{
+        // NOTE: The filepath should *never* be NULL here!
+        //       Make sure to validate `fp` before calling
+        //       this function!
+        assert(fp);
+
+        char **lns = read_file_to_lines(fp);
+        for (size_t i = 0; lns && lns[i]; ++i) {
+                line *ln = line_alloc();
+                size_t ln_n = strlen(lns[i]);
+
+                ln->chars = strdup(lns[i]);
+                ln->len = ln_n;
+                ln->cap = ln_n+1;
+
+                // TODO: refactor this code out
+                if (ctx->lines.len == ctx->lines.cap) {
+                        ctx->lines.cap = ctx->lines.cap ? ctx->lines.cap * 2 : 8;
+                        ctx->lines.data = realloc(ctx->lines.data, sizeof(line *) * ctx->lines.cap);
+                }
+                ctx->lines.data[ctx->lines.len++] = ln;
+
+                free(lns[i]);
+        }
+
+        if (lns) {
+                free(lns);
+        }
+}
+
+void
+input_loop(int argc, char **argv)
 {
         forge_logger_log(&logger, FORGE_LOG_LEVEL_DEBUG, "starting input loop");
 
         sten_context ctx = init_context();
 
+        forge_arg *arg = forge_arg_alloc(argc, argv, 1);
+        forge_arg *it = arg;
+        while (it) {
+                if (it->h == 0) {
+                        ctx.fp = fopen(arg->s, "r+");
+                        if (!ctx.fp) {
+                                forge_err_wargs("could not open file `%s`: %s", arg->s, strerror(errno));
+                        }
+                } else if (it->h == 1) {
+                        forge_err_wargs("unknown option %s", it->s);
+                } else {
+                        forge_err_wargs("unknown option %s", it->s);
+                }
+                it = it->n;
+        }
+        forge_arg_free(arg);
+
+        if (ctx.fp) {
+                load_txt_from_file(&ctx, ctx.fp);
+        }
+
         int ch;
         while ((ch = getch()) != CTRL('q')) {
                 switch (ch) {
+                case CTRL('s'): {
+                        save(&ctx);
+                } break;
                 case CTRL('d'): {
                         del_char_under_cursor(&ctx);
                 } break;
@@ -427,10 +617,14 @@ input_loop(void)
                 }
                 render(&ctx);
         }
+
+        if (ctx.fp) {
+                fclose(ctx.fp);
+        }
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
         (void)forge_io_truncate_file("log");
         if (!forge_logger_init(&logger, "log", FORGE_LOG_LEVEL_DEBUG)) {
@@ -438,7 +632,7 @@ main(void)
         }
 
         init_ncurses();
-        input_loop();
+        input_loop(argc, argv);
         endwin();
         return 0;
 }
