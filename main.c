@@ -316,6 +316,68 @@ backspace(sten_context *ctx)
 }
 
 void
+eol(sten_context *ctx)
+{
+        if (ctx->cursor.r < ctx->lines.len) {
+                line *ln = ctx->lines.data[ctx->cursor.r];
+                ctx->cursor.c = ln->len;
+        } else {
+                ctx->cursor.c = 0;
+        }
+        adjust_view(ctx);
+}
+
+void
+bol(sten_context *ctx)
+{
+        ctx->cursor.c = 0;
+        adjust_view(ctx);
+}
+
+void
+del_char_under_cursor(sten_context *ctx)
+{
+        if (ctx->lines.len == 0 || ctx->cursor.r >= ctx->lines.len) return;
+
+        line *ln = ctx->lines.data[ctx->cursor.r];
+        if (ctx->cursor.c < ln->len) {
+                /* Delete character under cursor */
+                memmove(ln->chars + ctx->cursor.c, ln->chars + ctx->cursor.c + 1, ln->len - ctx->cursor.c - 1);
+                ln->len--;
+        } else if (ctx->cursor.r + 1 < ctx->lines.len) {
+                /* Merge with next line if at end of current line */
+                line *next = ctx->lines.data[ctx->cursor.r + 1];
+                size_t old_len = ln->len;
+
+                /* Ensure capacity in current line */
+                size_t new_cap = ln->cap;
+                while (ln->len + next->len > new_cap) {
+                        new_cap = new_cap ? new_cap * 2 : 8;
+                }
+                if (new_cap != ln->cap) {
+                        ln->cap = new_cap;
+                        ln->chars = realloc(ln->chars, ln->cap);
+                }
+
+                /* Append next line to current */
+                if (next->len > 0) {
+                        memcpy(ln->chars + ln->len, next->chars, next->len);
+                        ln->len += next->len;
+                }
+
+                /* Free next line */
+                free(next->chars);
+                free(next);
+
+                /* Shift lines up */
+                memmove(ctx->lines.data + ctx->cursor.r + 1, ctx->lines.data + ctx->cursor.r + 2, (ctx->lines.len - ctx->cursor.r - 2) * sizeof(line *));
+                ctx->lines.len--;
+        }
+
+        adjust_view(ctx);
+}
+
+void
 input_loop(void)
 {
         forge_logger_log(&logger, FORGE_LOG_LEVEL_DEBUG, "starting input loop");
@@ -325,6 +387,15 @@ input_loop(void)
         int ch;
         while ((ch = getch()) != CTRL('q')) {
                 switch (ch) {
+                case CTRL('d'): {
+                        del_char_under_cursor(&ctx);
+                } break;
+                case CTRL('e'): {
+                        eol(&ctx);
+                } break;
+                case CTRL('a'): {
+                        bol(&ctx);
+                } break;
                 case CTRL('b'):
                 case KEY_LEFT: {
                         left(&ctx);
