@@ -3,6 +3,7 @@
 #include <forge/io.h>
 #include <forge/utils.h>
 #include <forge/arg.h>
+#include <forge/colors.h>
 
 #include <ncurses.h>
 
@@ -91,7 +92,9 @@ read_file_to_lines(FILE *f)
 }
 
 int
-write_lines(FILE *f, const line **lines, size_t lines_n)
+write_lines(FILE        *f,
+            const line **lines,
+            size_t       lines_n)
 {
         if (fseek(f, 0, SEEK_SET) != 0) {
                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to seek to start of file: %s", strerror(errno));
@@ -130,39 +133,6 @@ write_lines(FILE *f, const line **lines, size_t lines_n)
         return 1;
 }
 
-/* int */
-/* write_lines(FILE *f, const line **lines, size_t lines_n) */
-/* { */
-/*         if (fseek(f, 0, SEEK_SET) != 0) { */
-/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to seek to start of file: %s", strerror(errno)); */
-/*                 return 0; */
-/*         } */
-
-/*         // Truncate the file to zero length */
-/*         if (ftruncate(fileno(f), 0) != 0) { */
-/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to truncate file: %s", strerror(errno)); */
-/*                 return 0; */
-/*         } */
-
-/*         // Write lines */
-/*         for (size_t i = 0; i < lines_n; ++i) { */
-/*                 if (lines[i] && lines[i]->chars) { */
-/*                         if (fprintf(f, "%s\n", lines[i]->chars) < 0) { */
-/*                                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to write line %zu: %s", i, strerror(errno)); */
-/*                                 return 0; */
-/*                         } */
-/*                 } */
-/*         } */
-
-/*         // Flush the file to ensure data is written */
-/*         if (fflush(f) != 0) { */
-/*                 forge_logger_log(&logger, FORGE_LOG_LEVEL_ERR, "Failed to flush file: %s", strerror(errno)); */
-/*                 return 0; */
-/*         } */
-
-/*         return 1; */
-/* } */
-
 void
 init_ncurses(void)
 {
@@ -172,6 +142,8 @@ init_ncurses(void)
         noecho();
         timeout(100);
         getmaxyx(stdscr, g_scrn_height, g_scrn_width);
+        start_color();
+        init_pair(1, COLOR_WHITE, COLOR_RED);
 }
 
 line *
@@ -275,14 +247,29 @@ render(const sten_context *ctx)
         for (size_t sy = 0; sy < ctx->win.h; sy++) {
                 size_t buf_r = ctx->win.y_offset + sy;
                 if (buf_r >= ctx->lines.len) {
-                        /* Non-existent lines */
-                        //mvaddch(sy, 0, '~');
                         continue;
                 }
                 line *ln = ctx->lines.data[buf_r];
                 size_t sx = 0;
+
+                /* Find start of trailing whitespace */
+                size_t trail_start = ln->len;
+                for (size_t i = ln->len; i > 0; i--) {
+                        if (ln->chars[i - 1] != ' ' && ln->chars[i - 1] != '\t') {
+                                trail_start = i;
+                                break;
+                        }
+                }
+
+                /* Render characters */
                 for (size_t bx = ctx->win.x_offset; bx < ln->len && sx < ctx->win.w; bx++, sx++) {
-                        mvaddch(sy, sx, ln->chars[bx]);
+                        if (bx >= trail_start && (ln->chars[bx] == ' ' || ln->chars[bx] == '\t')) {
+                                attron(COLOR_PAIR(1));
+                                mvaddch(sy, sx, ln->chars[bx]);
+                                attroff(COLOR_PAIR(1));
+                        } else {
+                                mvaddch(sy, sx, ln->chars[bx]);
+                        }
                 }
         }
 
